@@ -551,7 +551,7 @@ start_wireguard_service() {
     fi
 }
 
-# 生成客户端配置
+# 生成普通客户端配置
 generate_client_config() {
     local client_name=$1
     local client_ip=$2
@@ -582,6 +582,7 @@ EOF
 
     # 添加客户端到服务端配置
     cat >> "$WG_CONFIG_DIR/$WG_INTERFACE.conf" << EOF
+# Client: $client_name
 [Peer]
 PublicKey = $client_public_key
 AllowedIPs = $client_ip/32
@@ -607,11 +608,109 @@ EOF
     cat "$client_dir/$client_name.conf"
 }
 
+# 生成Windows客户端配置
+generate_windows_client_config() {
+    local client_name=$1
+    local client_ip=$2
+    local traffic_mode=$3  # full 或 partial
+
+    log_info "为Windows客户端 $client_name 生成优化配置..."
+
+    # 生成客户端密钥对
+    local client_private_key=$(wg genkey)
+    local client_public_key=$(echo "$client_private_key" | wg pubkey)
+
+    # 创建客户端配置目录
+    local client_dir="$WG_CONFIG_DIR/clients"
+    mkdir -p "$client_dir"
+
+    # 根据流量模式设置AllowedIPs和DNS
+    local allowed_ips=""
+    local dns_servers=""
+    local config_suffix=""
+
+    if [[ $traffic_mode == "partial" ]]; then
+        # 内网访问模式
+        allowed_ips="10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12"
+        dns_servers="223.5.5.5, 119.29.29.29"
+        config_suffix="-internal"
+        log_info "配置模式: 内网访问（仅访问服务端内网资源）"
+    else
+        # 全局代理模式
+        allowed_ips="0.0.0.0/0"
+        dns_servers="223.5.5.5, 119.29.29.29, 8.8.8.8"
+        config_suffix="-global"
+        log_info "配置模式: 全局代理（所有流量通过VPN）"
+    fi
+
+    # 生成Windows优化的客户端配置文件
+    cat > "$client_dir/$client_name$config_suffix.conf" << EOF
+[Interface]
+PrivateKey = $client_private_key
+Address = $client_ip/$(echo $PRIVATE_SUBNET | cut -d'/' -f2)
+DNS = $dns_servers
+# Windows客户端MTU优化
+MTU = 1420
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = $SERVER_IP:$WG_PORT
+AllowedIPs = $allowed_ips
+# Windows客户端保持连接优化
+PersistentKeepalive = 25
+EOF
+
+    # 添加客户端到服务端配置
+    cat >> "$WG_CONFIG_DIR/$WG_INTERFACE.conf" << EOF
+# Windows Client: $client_name ($traffic_mode mode)
+[Peer]
+PublicKey = $client_public_key
+AllowedIPs = $client_ip/32
+
+EOF
+
+    # 重启WireGuard服务
+    systemctl restart wg-quick@$WG_INTERFACE >/dev/null 2>&1 || log_warn "服务重启失败"
+
+    log_success "Windows客户端 $client_name 配置生成完成"
+
+    # 显示Windows客户端特殊说明
+    echo ""
+    echo -e "${CYAN}=== Windows客户端使用说明 ===${NC}"
+    echo "1. 📱 推荐使用官方WireGuard客户端"
+    echo "2. 🔧 以管理员身份运行客户端"
+    echo "3. 🛡️ 在Windows防火墙中允许WireGuard"
+    echo "4. ⚡ MTU已优化为1420，适合大多数网络环境"
+
+    if [[ $traffic_mode == "partial" ]]; then
+        echo "5. 🌐 当前为内网访问模式，本地网络不受影响"
+        echo "6. 🔗 可访问服务端内网资源：10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12"
+    else
+        echo "5. 🌍 当前为全局代理模式，所有流量通过VPN"
+        echo "6. 🔒 提供完整的网络隐私保护"
+    fi
+    echo ""
+
+    # 生成二维码
+    if command -v qrencode >/dev/null 2>&1; then
+        echo ""
+        log_info "Windows客户端 $client_name 的二维码："
+        qrencode -t ansiutf8 < "$client_dir/$client_name$config_suffix.conf"
+        echo ""
+    fi
+
+    echo "Windows客户端配置文件位置: $client_dir/$client_name$config_suffix.conf"
+    echo ""
+    echo "配置内容："
+    cat "$client_dir/$client_name$config_suffix.conf"
+}
+
 # 添加客户端
 add_client() {
     log_info "添加新客户端..."
 
     # 获取客户端名称
+    local client_name=""
     while true; do
         read -p "请输入客户端名称: " client_name
         if [[ -z $client_name ]]; then
@@ -619,13 +718,78 @@ add_client() {
             continue
         fi
 
-        if [[ -f "$WG_CONFIG_DIR/clients/$client_name.conf" ]]; then
+        # 检查是否已存在（包括Windows客户端的不同配置文件）
+        if [[ -f "$WG_CONFIG_DIR/clients/$client_name.conf" ]] || \
+           [[ -f "$WG_CONFIG_DIR/clients/$client_name-global.conf" ]] || \
+           [[ -f "$WG_CONFIG_DIR/clients/$client_name-internal.conf" ]]; then
             log_error "客户端 $client_name 已存在"
             continue
         fi
 
         break
     done
+
+    # 询问客户端类型
+    echo ""
+    echo -e "${CYAN}请选择客户端类型：${NC}"
+    echo "1. Windows客户端（推荐，包含优化配置）"
+    echo "2. 其他客户端（Linux/macOS/Android/iOS等）"
+    echo ""
+
+    local client_type=""
+    while true; do
+        read -p "请选择客户端类型 (1-2): " client_type
+        case $client_type in
+            1)
+                client_type="windows"
+                break
+                ;;
+            2)
+                client_type="other"
+                break
+                ;;
+            *)
+                log_error "请输入有效的选项 (1-2)"
+                ;;
+        esac
+    done
+
+    # 如果是Windows客户端，询问流量模式
+    local traffic_mode=""
+    if [[ $client_type == "windows" ]]; then
+        echo ""
+        echo -e "${CYAN}请选择Windows客户端流量模式：${NC}"
+        echo ""
+        echo -e "${GREEN}1. 全局代理模式${NC}"
+        echo "   • 所有网络流量都通过VPN"
+        echo "   • 完全的IP地址隐藏和隐私保护"
+        echo "   • 适合：网络隐私保护、绕过地理限制"
+        echo ""
+        echo -e "${BLUE}2. 内网访问模式${NC}"
+        echo "   • 仅内网流量通过VPN"
+        echo "   • 本地网络访问不受影响"
+        echo "   • 适合：远程办公、访问公司内网资源"
+        echo ""
+
+        while true; do
+            read -p "请选择流量模式 (1-2): " mode_choice
+            case $mode_choice in
+                1)
+                    traffic_mode="full"
+                    log_info "已选择：全局代理模式"
+                    break
+                    ;;
+                2)
+                    traffic_mode="partial"
+                    log_info "已选择：内网访问模式"
+                    break
+                    ;;
+                *)
+                    log_error "请输入有效的选项 (1-2)"
+                    ;;
+            esac
+        done
+    fi
 
     # 获取下一个可用IP
     local subnet_base=$(echo "$PRIVATE_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3)
@@ -644,8 +808,34 @@ add_client() {
         return 1
     fi
 
-    generate_client_config "$client_name" "$next_ip"
+    # 根据客户端类型生成配置
+    if [[ $client_type == "windows" ]]; then
+        generate_windows_client_config "$client_name" "$next_ip" "$traffic_mode"
+    else
+        generate_client_config "$client_name" "$next_ip"
+    fi
+
     ((CLIENT_COUNT++))
+
+    echo ""
+    log_success "客户端添加完成！"
+
+    # 显示后续操作建议
+    if [[ $client_type == "windows" ]]; then
+        echo ""
+        echo -e "${YELLOW}Windows客户端后续操作：${NC}"
+        echo "1. 下载WireGuard客户端：https://www.wireguard.com/install/"
+        echo "2. 以管理员身份运行WireGuard客户端"
+        echo "3. 导入上面显示的配置文件或扫描二维码"
+        echo "4. 在Windows防火墙中允许WireGuard应用"
+        echo "5. 连接并测试网络连通性"
+    else
+        echo ""
+        echo -e "${YELLOW}客户端后续操作：${NC}"
+        echo "1. 将配置文件传输到客户端设备"
+        echo "2. 导入配置文件到WireGuard客户端"
+        echo "3. 连接并测试网络连通性"
+    fi
 }
 
 # 列出所有客户端
@@ -659,24 +849,79 @@ list_clients() {
     fi
 
     echo ""
-    printf "%-20s %-15s %-10s\n" "客户端名称" "IP地址" "状态"
-    echo "================================================"
+    printf "%-25s %-15s %-12s %-10s\n" "客户端名称" "IP地址" "类型" "状态"
+    echo "================================================================"
+
+    # 用于跟踪已处理的客户端名称（避免Windows客户端重复显示）
+    local processed_clients=()
 
     for config_file in "$client_dir"/*.conf; do
         if [[ -f $config_file ]]; then
-            local client_name=$(basename "$config_file" .conf)
+            local full_name=$(basename "$config_file" .conf)
             local client_ip=$(grep "Address" "$config_file" | cut -d'=' -f2 | cut -d'/' -f1 | tr -d ' ')
             local status="离线"
+            local client_type="普通"
+            local display_name="$full_name"
+
+            # 检查是否是Windows客户端
+            if [[ $full_name =~ -global$ ]]; then
+                client_type="Windows(全局)"
+                display_name="${full_name%-global}"
+            elif [[ $full_name =~ -internal$ ]]; then
+                client_type="Windows(内网)"
+                display_name="${full_name%-internal}"
+            fi
+
+            # 检查是否已经处理过这个客户端（避免Windows客户端重复）
+            local already_processed=false
+            for processed in "${processed_clients[@]}"; do
+                if [[ $processed == $display_name ]]; then
+                    already_processed=true
+                    break
+                fi
+            done
+
+            if [[ $already_processed == true ]]; then
+                continue
+            fi
 
             # 检查客户端是否在线（通过WireGuard状态）
             if command -v wg >/dev/null 2>&1 && wg show | grep -q "$client_ip"; then
                 status="在线"
             fi
 
-            printf "%-20s %-15s %-10s\n" "$client_name" "$client_ip" "$status"
+            printf "%-25s %-15s %-12s %-10s\n" "$display_name" "$client_ip" "$client_type" "$status"
+            processed_clients+=("$display_name")
         fi
     done
+
     echo ""
+
+    # 显示统计信息
+    local total_clients=${#processed_clients[@]}
+    local online_clients=0
+    if command -v wg >/dev/null 2>&1; then
+        online_clients=$(wg show | grep -c "peer:" 2>/dev/null || echo "0")
+    fi
+
+    echo "总客户端数: $total_clients | 在线: $online_clients | 离线: $((total_clients - online_clients))"
+    echo ""
+
+    # 显示Windows客户端特别说明
+    local has_windows_clients=false
+    for config_file in "$client_dir"/*.conf; do
+        if [[ -f $config_file ]] && [[ $(basename "$config_file") =~ -(global|internal)\.conf$ ]]; then
+            has_windows_clients=true
+            break
+        fi
+    done
+
+    if [[ $has_windows_clients == true ]]; then
+        echo -e "${CYAN}Windows客户端说明：${NC}"
+        echo "• 全局模式：所有流量通过VPN"
+        echo "• 内网模式：仅访问服务端内网资源"
+        echo ""
+    fi
 }
 
 # 显示服务状态
