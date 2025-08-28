@@ -487,29 +487,17 @@ EOF
 configure_firewall() {
     log_info "配置防火墙规则..."
 
-    # 检测防火墙类型并配置
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-        log_info "配置UFW防火墙..."
-        ufw allow "$WG_PORT"/udp >/dev/null 2>&1 || log_warn "UFW规则添加失败"
-        ufw allow ssh >/dev/null 2>&1 || true
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        log_info "配置firewalld防火墙..."
-        firewall-cmd --permanent --add-port="$WG_PORT"/udp >/dev/null 2>&1 || log_warn "firewalld规则添加失败"
-        firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    else
-        log_info "配置iptables防火墙..."
-        # 添加iptables规则
-        iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || log_warn "iptables INPUT规则添加失败"
-        iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-        iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
+    # 使用新的智能防火墙配置
+    open_firewall_port "$WG_PORT" "udp" "WireGuard VPN"
 
-        # 尝试保存iptables规则
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
+    # 允许SSH端口（如果存在）
+    local ssh_port="22"
+    if ss -tulpn | grep ":22 " >/dev/null 2>&1; then
+        open_firewall_port "$ssh_port" "tcp" "SSH"
     fi
+
+    # 配置NAT规则
+    configure_nat_rules
 
     log_info "防火墙配置完成"
 }
@@ -1031,6 +1019,325 @@ network_diagnosis() {
     echo ""
 }
 
+# ==================== 防火墙和NAT管理功能 ====================
+
+# 检测防火墙类型
+detect_firewall_type() {
+    local firewall_type="none"
+
+    # 检测UFW
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status | grep -q "Status: active"; then
+            firewall_type="ufw"
+        fi
+    fi
+
+    # 检测firewalld
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if systemctl is-active --quiet firewalld; then
+            firewall_type="firewalld"
+        fi
+    fi
+
+    # 检测iptables
+    if command -v iptables >/dev/null 2>&1; then
+        local iptables_rules=$(iptables -L INPUT | wc -l)
+        if [[ $iptables_rules -gt 3 ]]; then  # 默认有3行头部信息
+            if [[ $firewall_type == "none" ]]; then
+                firewall_type="iptables"
+            fi
+        fi
+    fi
+
+    echo "$firewall_type"
+}
+
+# 检查端口是否在防火墙中开放
+check_firewall_port() {
+    local port=$1
+    local protocol=${2:-tcp}
+    local firewall_type=$(detect_firewall_type)
+
+    case $firewall_type in
+        "ufw")
+            if ufw status | grep -q "$port/$protocol"; then
+                return 0
+            fi
+            ;;
+        "firewalld")
+            if firewall-cmd --list-ports | grep -q "$port/$protocol"; then
+                return 0
+            fi
+            ;;
+        "iptables")
+            if iptables -L INPUT | grep -q "dpt:$port"; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+# 在防火墙中开放端口
+open_firewall_port() {
+    local port=$1
+    local protocol=${2:-tcp}
+    local description=${3:-"WireGuard"}
+    local firewall_type=$(detect_firewall_type)
+
+    log_info "在防火墙中开放端口 $port/$protocol..."
+
+    case $firewall_type in
+        "ufw")
+            ufw allow "$port/$protocol" comment "$description" >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                log_success "UFW: 端口 $port/$protocol 已开放"
+            else
+                log_warn "UFW: 端口 $port/$protocol 开放失败"
+            fi
+            ;;
+        "firewalld")
+            firewall-cmd --permanent --add-port="$port/$protocol" >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                log_success "firewalld: 端口 $port/$protocol 已开放"
+            else
+                log_warn "firewalld: 端口 $port/$protocol 开放失败"
+            fi
+            ;;
+        "iptables")
+            iptables -I INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null
+            if [[ $? -eq 0 ]]; then
+                log_success "iptables: 端口 $port/$protocol 已开放"
+                # 保存iptables规则
+                if command -v iptables-save >/dev/null 2>&1; then
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                fi
+            else
+                log_warn "iptables: 端口 $port/$protocol 开放失败"
+            fi
+            ;;
+        "none")
+            log_warn "未检测到活跃的防火墙，跳过端口开放"
+            ;;
+    esac
+}
+
+# 检查NAT是否正确配置
+check_nat_configuration() {
+    log_info "检查NAT配置..."
+
+    # 检查IP转发
+    if [[ $(cat /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
+        log_warn "IP转发未启用"
+        return 1
+    fi
+
+    # 检查MASQUERADE规则
+    if ! iptables -t nat -L POSTROUTING | grep -q "MASQUERADE"; then
+        log_warn "未找到MASQUERADE规则"
+        return 1
+    fi
+
+    # 检查WireGuard接口的转发规则
+    if ip link show $WG_INTERFACE >/dev/null 2>&1; then
+        if ! iptables -L FORWARD | grep -q "$WG_INTERFACE"; then
+            log_warn "WireGuard接口转发规则缺失"
+            return 1
+        fi
+    fi
+
+    log_success "NAT配置正常"
+    return 0
+}
+
+# 配置NAT规则
+configure_nat_rules() {
+    log_info "配置NAT规则..."
+
+    # 启用IP转发
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+    fi
+    log_success "IP转发已启用"
+
+    # 获取主网络接口
+    local main_interface=$(ip route | grep default | awk '{print $5}' | head -n1)
+    if [[ -z $main_interface ]]; then
+        main_interface="eth0"  # 默认接口
+    fi
+
+    # 添加MASQUERADE规则
+    if ! iptables -t nat -C POSTROUTING -o "$main_interface" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -o "$main_interface" -j MASQUERADE
+        log_success "已添加MASQUERADE规则 ($main_interface)"
+    fi
+
+    # 添加WireGuard接口转发规则
+    if ip link show $WG_INTERFACE >/dev/null 2>&1; then
+        if ! iptables -C FORWARD -i $WG_INTERFACE -j ACCEPT 2>/dev/null; then
+            iptables -I FORWARD -i $WG_INTERFACE -j ACCEPT
+        fi
+        if ! iptables -C FORWARD -o $WG_INTERFACE -j ACCEPT 2>/dev/null; then
+            iptables -I FORWARD -o $WG_INTERFACE -j ACCEPT
+        fi
+        log_success "WireGuard接口转发规则已配置"
+    fi
+
+    # 保存iptables规则
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+}
+
+# 检查云服务商安全组
+check_cloud_security_groups() {
+    log_info "检查云服务商安全组配置..."
+
+    # 尝试检测云服务商
+    local cloud_provider="unknown"
+
+    # 检测阿里云
+    if curl -s --connect-timeout 2 http://100.100.100.200/latest/meta-data/instance-id >/dev/null 2>&1; then
+        cloud_provider="aliyun"
+    # 检测腾讯云
+    elif curl -s --connect-timeout 2 http://metadata.tencentyun.com/latest/meta-data/instance-id >/dev/null 2>&1; then
+        cloud_provider="tencent"
+    # 检测AWS
+    elif curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/instance-id >/dev/null 2>&1; then
+        cloud_provider="aws"
+    # 检测Google Cloud
+    elif curl -s --connect-timeout 2 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/id >/dev/null 2>&1; then
+        cloud_provider="gcp"
+    fi
+
+    case $cloud_provider in
+        "aliyun")
+            log_warn "检测到阿里云ECS"
+            echo "  请在阿里云控制台检查安全组规则："
+            echo "  1. 登录阿里云控制台"
+            echo "  2. 进入ECS实例管理"
+            echo "  3. 点击'安全组' -> '配置规则'"
+            echo "  4. 添加入方向规则，开放WireGuard端口 $WG_PORT/UDP"
+            ;;
+        "tencent")
+            log_warn "检测到腾讯云CVM"
+            echo "  请在腾讯云控制台检查安全组规则："
+            echo "  1. 登录腾讯云控制台"
+            echo "  2. 进入云服务器CVM"
+            echo "  3. 点击'安全组' -> '修改规则'"
+            echo "  4. 添加入站规则，开放WireGuard端口 $WG_PORT/UDP"
+            ;;
+        "aws")
+            log_warn "检测到AWS EC2"
+            echo "  请在AWS控制台检查Security Groups："
+            echo "  1. 登录AWS控制台"
+            echo "  2. 进入EC2 Dashboard"
+            echo "  3. 点击'Security Groups'"
+            echo "  4. 编辑Inbound Rules，添加UDP $WG_PORT"
+            ;;
+        "gcp")
+            log_warn "检测到Google Cloud"
+            echo "  请在GCP控制台检查防火墙规则："
+            echo "  1. 登录Google Cloud Console"
+            echo "  2. 进入VPC网络 -> 防火墙"
+            echo "  3. 创建防火墙规则，允许UDP $WG_PORT"
+            ;;
+        *)
+            log_info "未检测到已知云服务商"
+            echo "  如果使用云服务器，请检查云服务商的安全组/防火墙设置"
+            ;;
+    esac
+    echo ""
+}
+
+# 全面的防火墙和NAT检查
+comprehensive_firewall_check() {
+    log_info "执行全面的防火墙和NAT检查..."
+    echo ""
+
+    local issues_found=false
+
+    # 1. 检查防火墙类型和状态
+    echo -e "${BLUE}1. 防火墙状态检查${NC}"
+    local firewall_type=$(detect_firewall_type)
+    echo "检测到的防火墙类型: $firewall_type"
+
+    # 2. 检查WireGuard端口
+    echo -e "${BLUE}2. WireGuard端口检查${NC}"
+    if check_firewall_port "$WG_PORT" "udp"; then
+        log_success "WireGuard端口 $WG_PORT/UDP 已在防火墙中开放"
+    else
+        log_warn "WireGuard端口 $WG_PORT/UDP 未在防火墙中开放"
+        issues_found=true
+    fi
+
+    # 3. 检查端口转发规则的端口
+    if [[ -f $FORWARD_RULES_FILE ]] && [[ -s $FORWARD_RULES_FILE ]]; then
+        echo -e "${BLUE}3. 端口转发规则检查${NC}"
+        while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+            if check_firewall_port "$public_port" "tcp"; then
+                log_success "转发端口 $public_port/TCP 已在防火墙中开放"
+            else
+                log_warn "转发端口 $public_port/TCP 未在防火墙中开放"
+                issues_found=true
+            fi
+        done < "$FORWARD_RULES_FILE"
+    fi
+
+    # 4. 检查NAT配置
+    echo -e "${BLUE}4. NAT配置检查${NC}"
+    if ! check_nat_configuration; then
+        issues_found=true
+    fi
+
+    # 5. 检查云服务商安全组
+    echo -e "${BLUE}5. 云服务商安全组检查${NC}"
+    check_cloud_security_groups
+
+    # 6. 提供修复建议
+    if [[ $issues_found == true ]]; then
+        echo -e "${YELLOW}发现配置问题，是否自动修复？(y/N): ${NC}"
+        read -p "" auto_fix
+
+        if [[ $auto_fix =~ ^[Yy]$ ]]; then
+            auto_fix_firewall_issues
+        fi
+    else
+        log_success "所有防火墙和NAT配置检查通过！"
+    fi
+}
+
+# 自动修复防火墙问题
+auto_fix_firewall_issues() {
+    log_info "开始自动修复防火墙问题..."
+
+    # 1. 开放WireGuard端口
+    if ! check_firewall_port "$WG_PORT" "udp"; then
+        open_firewall_port "$WG_PORT" "udp" "WireGuard VPN"
+    fi
+
+    # 2. 开放端口转发规则的端口
+    if [[ -f $FORWARD_RULES_FILE ]] && [[ -s $FORWARD_RULES_FILE ]]; then
+        while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+            if ! check_firewall_port "$public_port" "tcp"; then
+                open_firewall_port "$public_port" "tcp" "Port Forward $service_name"
+            fi
+        done < "$FORWARD_RULES_FILE"
+    fi
+
+    # 3. 配置NAT规则
+    configure_nat_rules
+
+    log_success "自动修复完成！"
+    echo ""
+    echo -e "${YELLOW}重要提醒：${NC}"
+    echo "如果仍无法连接，请检查云服务商的安全组设置！"
+    echo "大多数连接问题都是由于云服务商安全组未开放端口导致的。"
+}
+
 # ==================== 端口转发功能 ====================
 
 # 检查端口是否被占用
@@ -1196,6 +1503,9 @@ add_port_forward() {
     # 保存规则到配置文件
     mkdir -p "$(dirname "$FORWARD_RULES_FILE")"
     echo "$public_port:$client_name:$client_ip:$target_port:$service_name:$(date)" >> "$FORWARD_RULES_FILE"
+
+    # 在防火墙中开放公网端口
+    open_firewall_port "$public_port" "tcp" "Port Forward $service_name"
 
     # 保存iptables规则
     if command -v iptables-save >/dev/null 2>&1; then
@@ -1563,8 +1873,9 @@ show_main_menu() {
     echo "4. 列出所有客户端"
     echo "5. 显示服务状态"
     echo "6. 端口转发管理 (通过公网IP访问客户端)"
-    echo "7. 网络诊断"
-    echo "8. 卸载WireGuard"
+    echo "7. 防火墙和NAT检查 (检查端口开放和安全组)"
+    echo "8. 网络诊断"
+    echo "9. 卸载WireGuard"
     echo "0. 退出"
     echo ""
 }
@@ -1719,7 +2030,7 @@ main() {
 
     while true; do
         show_main_menu
-        read -p "请输入选项 (0-7): " choice
+        read -p "请输入选项 (0-9): " choice
 
         case $choice in
             1)
@@ -1766,10 +2077,15 @@ main() {
                 port_forward_menu
                 ;;
             7)
-                network_diagnosis
+                # 防火墙和NAT检查
+                comprehensive_firewall_check
                 read -p "按回车键继续..."
                 ;;
             8)
+                network_diagnosis
+                read -p "按回车键继续..."
+                ;;
+            9)
                 uninstall_wireguard
                 read -p "按回车键继续..."
                 ;;
@@ -1970,33 +2286,4 @@ EOF
     log_info "系统优化配置完成"
 }
 
-# 配置防火墙
-configure_firewall() {
-    log_info "配置防火墙规则..."
 
-    # 检测防火墙类型并配置
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-        log_info "配置UFW防火墙..."
-        ufw allow "$WG_PORT"/udp >/dev/null 2>&1 || log_warn "UFW规则添加失败"
-        ufw allow ssh >/dev/null 2>&1 || true
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        log_info "配置firewalld防火墙..."
-        firewall-cmd --permanent --add-port="$WG_PORT"/udp >/dev/null 2>&1 || log_warn "firewalld规则添加失败"
-        firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    else
-        log_info "配置iptables防火墙..."
-        # 添加iptables规则
-        iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || log_warn "iptables INPUT规则添加失败"
-        iptables -A FORWARD -i "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-        iptables -A FORWARD -o "$WG_INTERFACE" -j ACCEPT 2>/dev/null || true
-        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
-
-        # 尝试保存iptables规则
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
-    fi
-
-    log_info "防火墙配置完成"
-}
