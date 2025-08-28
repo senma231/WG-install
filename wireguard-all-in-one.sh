@@ -24,7 +24,7 @@ WHITE='\033[1;37m'
 NC='\033[0m'
 
 # 全局变量
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 WG_CONFIG_DIR="/etc/wireguard"
 WG_INTERFACE="wg0"
 WG_PORT="51820"
@@ -38,6 +38,7 @@ SERVER_IP=""
 PRIVATE_SUBNET="10.66.0.0/16"
 PRIVATE_SUBNET_IP="10.66.0.1"
 DNS_SERVERS="8.8.8.8,8.8.4.4"
+FORWARD_RULES_FILE="/etc/wireguard/port-forwards.conf"
 
 # 日志函数
 log_info() {
@@ -68,12 +69,14 @@ show_banner() {
     echo -e "${CYAN}"
     cat << "EOF"
 ╔══════════════════════════════════════════════════════════════╗
-║                WireGuard 一体化安装脚本                       ║
+║                WireGuard 一体化全能脚本                       ║
 ║                                                              ║
-║  🚀 功能特性:                                                 ║
+║  🚀 核心功能:                                                 ║
 ║  • 完全交互式安装界面                                          ║
 ║  • 国内外网络环境自动适配                                      ║
 ║  • 智能网络优化配置                                            ║
+║  • Windows客户端智能优化                                      ║
+║  • 端口转发管理 (通过公网IP访问客户端)                         ║
 ║  • 批量客户端管理                                              ║
 ║  • 系统监控和故障诊断                                          ║
 ║  • 配置备份和恢复                                              ║
@@ -1028,6 +1031,525 @@ network_diagnosis() {
     echo ""
 }
 
+# ==================== 端口转发功能 ====================
+
+# 检查端口是否被占用
+check_port_usage() {
+    local port=$1
+    if ss -tulpn | grep ":$port " >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# 获取客户端列表（用于端口转发）
+get_client_list_for_forward() {
+    local clients=()
+    local client_dir="$WG_CONFIG_DIR/clients"
+
+    if [[ -d $client_dir ]]; then
+        for config_file in "$client_dir"/*.conf; do
+            if [[ -f $config_file ]]; then
+                local client_name=$(basename "$config_file" .conf)
+                local client_ip=$(grep "Address" "$config_file" | cut -d'=' -f2 | cut -d'/' -f1 | tr -d ' ')
+
+                # 检查客户端是否在线
+                if wg show | grep -q "$client_ip"; then
+                    clients+=("$client_name:$client_ip:在线")
+                else
+                    clients+=("$client_name:$client_ip:离线")
+                fi
+            fi
+        done
+    fi
+
+    echo "${clients[@]}"
+}
+
+# 添加端口转发规则
+add_port_forward() {
+    log_info "添加端口转发规则..."
+
+    # 获取客户端列表
+    local clients=($(get_client_list_for_forward))
+    if [[ ${#clients[@]} -eq 0 ]]; then
+        log_error "没有找到客户端配置"
+        echo "请先添加客户端后再配置端口转发"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}可用的客户端：${NC}"
+    local i=1
+    for client in "${clients[@]}"; do
+        IFS=':' read -r name ip status <<< "$client"
+        if [[ $status == "在线" ]]; then
+            echo -e "$i. ${GREEN}$name${NC} ($ip) - $status"
+        else
+            echo -e "$i. ${RED}$name${NC} ($ip) - $status"
+        fi
+        ((i++))
+    done
+
+    echo ""
+    read -p "请选择要转发到的客户端编号: " client_choice
+
+    if [[ ! $client_choice =~ ^[0-9]+$ ]] || [[ $client_choice -lt 1 ]] || [[ $client_choice -gt ${#clients[@]} ]]; then
+        log_error "无效的客户端选择"
+        return 1
+    fi
+
+    local selected_client="${clients[$((client_choice-1))]}"
+    IFS=':' read -r client_name client_ip client_status <<< "$selected_client"
+
+    if [[ $client_status == "离线" ]]; then
+        log_warn "警告: 选择的客户端当前离线"
+        read -p "是否继续添加转发规则？(y/N): " continue_offline
+        if [[ ! $continue_offline =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+
+    echo ""
+    echo -e "${CYAN}常用服务端口：${NC}"
+    echo "1. RDP (远程桌面) - 3389"
+    echo "2. SSH - 22"
+    echo "3. HTTP - 80"
+    echo "4. HTTPS - 443"
+    echo "5. FTP - 21"
+    echo "6. 自定义端口"
+    echo ""
+
+    read -p "请选择服务类型 (1-6): " service_choice
+
+    local target_port=""
+    local service_name=""
+
+    case $service_choice in
+        1)
+            target_port="3389"
+            service_name="RDP"
+            ;;
+        2)
+            target_port="22"
+            service_name="SSH"
+            ;;
+        3)
+            target_port="80"
+            service_name="HTTP"
+            ;;
+        4)
+            target_port="443"
+            service_name="HTTPS"
+            ;;
+        5)
+            target_port="21"
+            service_name="FTP"
+            ;;
+        6)
+            read -p "请输入目标端口: " target_port
+            read -p "请输入服务名称: " service_name
+            ;;
+        *)
+            log_error "无效的服务类型选择"
+            return 1
+            ;;
+    esac
+
+    if [[ ! $target_port =~ ^[0-9]+$ ]] || [[ $target_port -lt 1 ]] || [[ $target_port -gt 65535 ]]; then
+        log_error "无效的端口号"
+        return 1
+    fi
+
+    # 选择公网端口
+    local public_port=""
+    read -p "请输入公网端口 (默认与目标端口相同: $target_port): " public_port
+    public_port=${public_port:-$target_port}
+
+    if [[ ! $public_port =~ ^[0-9]+$ ]] || [[ $public_port -lt 1 ]] || [[ $public_port -gt 65535 ]]; then
+        log_error "无效的公网端口号"
+        return 1
+    fi
+
+    # 检查公网端口是否被占用
+    if ! check_port_usage "$public_port"; then
+        log_error "公网端口 $public_port 已被占用"
+        return 1
+    fi
+
+    # 添加iptables规则
+    log_info "添加iptables转发规则..."
+
+    # DNAT规则 - 将公网端口转发到客户端
+    iptables -t nat -A PREROUTING -p tcp --dport "$public_port" -j DNAT --to-destination "$client_ip:$target_port"
+
+    # FORWARD规则 - 允许转发
+    iptables -A FORWARD -p tcp -d "$client_ip" --dport "$target_port" -j ACCEPT
+    iptables -A FORWARD -p tcp -s "$client_ip" --sport "$target_port" -j ACCEPT
+
+    # INPUT规则 - 允许公网端口访问
+    iptables -A INPUT -p tcp --dport "$public_port" -j ACCEPT
+
+    # MASQUERADE规则 - 确保返回流量正确
+    iptables -t nat -A POSTROUTING -p tcp -d "$client_ip" --dport "$target_port" -j MASQUERADE
+
+    # 保存规则到配置文件
+    mkdir -p "$(dirname "$FORWARD_RULES_FILE")"
+    echo "$public_port:$client_name:$client_ip:$target_port:$service_name:$(date)" >> "$FORWARD_RULES_FILE"
+
+    # 保存iptables规则
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+
+    log_success "端口转发规则添加成功！"
+    echo ""
+    echo -e "${CYAN}转发规则信息：${NC}"
+    echo "服务名称: $service_name"
+    echo "客户端: $client_name ($client_ip)"
+    echo "公网端口: $public_port"
+    echo "目标端口: $target_port"
+    echo ""
+    echo -e "${YELLOW}访问方式：${NC}"
+
+    if [[ $service_name == "RDP" ]]; then
+        echo "远程桌面连接: $SERVER_IP:$public_port"
+        echo "或在远程桌面客户端中输入: $SERVER_IP:$public_port"
+    elif [[ $service_name == "SSH" ]]; then
+        echo "SSH连接: ssh user@$SERVER_IP -p $public_port"
+    elif [[ $service_name == "HTTP" ]]; then
+        echo "HTTP访问: http://$SERVER_IP:$public_port"
+    elif [[ $service_name == "HTTPS" ]]; then
+        echo "HTTPS访问: https://$SERVER_IP:$public_port"
+    else
+        echo "访问地址: $SERVER_IP:$public_port"
+    fi
+
+    echo ""
+    echo -e "${BLUE}Windows客户端配置提醒：${NC}"
+    if [[ $service_name == "RDP" ]]; then
+        echo "1. 启用远程桌面："
+        echo "   Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -name 'fDenyTSConnections' -value 0"
+        echo "2. 允许防火墙："
+        echo "   Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'"
+    else
+        echo "1. 确保目标服务正在运行"
+        echo "2. 检查Windows防火墙设置"
+        echo "3. 允许端口通过防火墙："
+        echo "   New-NetFirewallRule -DisplayName 'Allow Port $target_port' -Direction Inbound -Protocol TCP -LocalPort $target_port -Action Allow"
+    fi
+}
+
+# 列出端口转发规则
+list_port_forwards() {
+    log_info "当前端口转发规则："
+
+    if [[ ! -f $FORWARD_RULES_FILE ]] || [[ ! -s $FORWARD_RULES_FILE ]]; then
+        echo "暂无端口转发规则"
+        echo ""
+        echo "使用 '添加端口转发规则' 来配置端口转发"
+        return
+    fi
+
+    echo ""
+    printf "%-8s %-15s %-15s %-8s %-10s %-20s\n" "公网端口" "客户端名称" "客户端IP" "目标端口" "服务" "创建时间"
+    echo "=================================================================================="
+
+    while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+        # 检查客户端是否在线
+        local status="离线"
+        if wg show | grep -q "$client_ip"; then
+            status="在线"
+        fi
+
+        if [[ $status == "在线" ]]; then
+            printf "%-8s %-15s ${GREEN}%-15s${NC} %-8s %-10s %-20s\n" "$public_port" "$client_name" "$client_ip" "$target_port" "$service_name" "$create_time"
+        else
+            printf "%-8s %-15s ${RED}%-15s${NC} %-8s %-10s %-20s\n" "$public_port" "$client_name" "$client_ip" "$target_port" "$service_name" "$create_time"
+        fi
+    done < "$FORWARD_RULES_FILE"
+
+    echo ""
+
+    # 显示访问信息
+    echo -e "${CYAN}服务端公网IP: $SERVER_IP${NC}"
+    echo "通过 服务端IP:公网端口 访问对应的客户端服务"
+    echo ""
+
+    # 显示具体访问方式
+    echo -e "${YELLOW}访问方式：${NC}"
+    while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+        case $service_name in
+            "RDP")
+                echo "  远程桌面: mstsc → $SERVER_IP:$public_port"
+                ;;
+            "SSH")
+                echo "  SSH连接: ssh user@$SERVER_IP -p $public_port"
+                ;;
+            "HTTP")
+                echo "  HTTP访问: http://$SERVER_IP:$public_port"
+                ;;
+            "HTTPS")
+                echo "  HTTPS访问: https://$SERVER_IP:$public_port"
+                ;;
+            *)
+                echo "  $service_name: $SERVER_IP:$public_port"
+                ;;
+        esac
+    done < "$FORWARD_RULES_FILE"
+}
+
+# 删除端口转发规则
+remove_port_forward() {
+    log_info "删除端口转发规则..."
+
+    if [[ ! -f $FORWARD_RULES_FILE ]] || [[ ! -s $FORWARD_RULES_FILE ]]; then
+        log_warn "暂无端口转发规则可删除"
+        return
+    fi
+
+    echo ""
+    echo "现有端口转发规则："
+    local rules=()
+    local i=1
+
+    while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+        rules+=("$public_port:$client_name:$client_ip:$target_port:$service_name:$create_time")
+        echo "$i. $service_name - $client_name ($client_ip) - 公网端口:$public_port → 目标端口:$target_port"
+        ((i++))
+    done < "$FORWARD_RULES_FILE"
+
+    echo ""
+    read -p "请选择要删除的规则编号: " rule_choice
+
+    if [[ ! $rule_choice =~ ^[0-9]+$ ]] || [[ $rule_choice -lt 1 ]] || [[ $rule_choice -gt ${#rules[@]} ]]; then
+        log_error "无效的规则选择"
+        return 1
+    fi
+
+    local selected_rule="${rules[$((rule_choice-1))]}"
+    IFS=':' read -r public_port client_name client_ip target_port service_name create_time <<< "$selected_rule"
+
+    # 确认删除
+    echo ""
+    echo "将要删除的规则："
+    echo "服务: $service_name"
+    echo "客户端: $client_name ($client_ip)"
+    echo "公网端口: $public_port → 目标端口: $target_port"
+    echo ""
+
+    read -p "确认删除此规则？(y/N): " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        log_info "取消删除"
+        return
+    fi
+
+    # 删除iptables规则
+    log_info "删除iptables规则..."
+
+    iptables -t nat -D PREROUTING -p tcp --dport "$public_port" -j DNAT --to-destination "$client_ip:$target_port" 2>/dev/null || true
+    iptables -D FORWARD -p tcp -d "$client_ip" --dport "$target_port" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p tcp -s "$client_ip" --sport "$target_port" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp --dport "$public_port" -j ACCEPT 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -p tcp -d "$client_ip" --dport "$target_port" -j MASQUERADE 2>/dev/null || true
+
+    # 从配置文件中删除规则
+    local temp_file=$(mktemp)
+    grep -v "^$public_port:$client_name:$client_ip:$target_port:$service_name:" "$FORWARD_RULES_FILE" > "$temp_file" || true
+    mv "$temp_file" "$FORWARD_RULES_FILE"
+
+    # 保存iptables规则
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+
+    log_success "端口转发规则删除成功！"
+}
+
+# 端口转发故障排查
+troubleshoot_port_forward() {
+    log_info "端口转发故障排查..."
+    echo ""
+
+    # 1. 检查WireGuard服务状态
+    echo -e "${BLUE}1. 检查WireGuard服务状态${NC}"
+    if systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
+        log_success "WireGuard服务运行正常"
+        local peer_count=$(wg show $WG_INTERFACE peers 2>/dev/null | wc -l)
+        echo "   连接的客户端数: $peer_count"
+    else
+        log_error "WireGuard服务未运行"
+        echo "   解决方法: sudo systemctl start wg-quick@$WG_INTERFACE"
+    fi
+    echo ""
+
+    # 2. 检查IP转发
+    echo -e "${BLUE}2. 检查IP转发设置${NC}"
+    if [[ $(cat /proc/sys/net/ipv4/ip_forward) == "1" ]]; then
+        log_success "IP转发已启用"
+    else
+        log_error "IP转发未启用"
+        echo "   解决方法: echo 1 > /proc/sys/net/ipv4/ip_forward"
+    fi
+    echo ""
+
+    # 3. 检查端口转发规则
+    echo -e "${BLUE}3. 检查端口转发规则${NC}"
+    if [[ -f $FORWARD_RULES_FILE ]] && [[ -s $FORWARD_RULES_FILE ]]; then
+        local rules_count=$(wc -l < "$FORWARD_RULES_FILE")
+        echo "   配置的转发规则数: $rules_count"
+
+        while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+            echo "   检查规则: $public_port → $client_ip:$target_port"
+
+            # 检查DNAT规则
+            if iptables -t nat -C PREROUTING -p tcp --dport "$public_port" -j DNAT --to-destination "$client_ip:$target_port" 2>/dev/null; then
+                echo "     ✓ DNAT规则存在"
+            else
+                echo "     ✗ DNAT规则缺失"
+            fi
+
+            # 检查客户端连接状态
+            if wg show | grep -q "$client_ip"; then
+                echo "     ✓ 客户端在线"
+            else
+                echo "     ✗ 客户端离线"
+            fi
+
+            # 测试到客户端的连通性
+            if ping -c 1 -W 2 "$client_ip" >/dev/null 2>&1; then
+                echo "     ✓ 客户端网络连通"
+            else
+                echo "     ✗ 客户端网络不通"
+            fi
+
+        done < "$FORWARD_RULES_FILE"
+    else
+        log_warn "没有配置端口转发规则"
+    fi
+    echo ""
+
+    # 4. 常见问题解决建议
+    echo -e "${BLUE}4. 常见问题解决建议${NC}"
+    echo ""
+    echo -e "${YELLOW}如果无法连接，请检查：${NC}"
+    echo "1. VPS提供商安全组/防火墙设置（最常见原因）"
+    echo "   - 阿里云: ECS控制台 → 安全组 → 添加规则"
+    echo "   - 腾讯云: CVM控制台 → 安全组 → 添加规则"
+    echo "   - AWS: EC2控制台 → Security Groups → Inbound Rules"
+    echo ""
+    echo "2. Windows客户端设置："
+    echo "   - 确认WireGuard客户端已连接"
+    echo "   - 检查Windows防火墙设置"
+    echo "   - 启用目标服务（如RDP）"
+    echo ""
+    echo "3. 服务端设置："
+    echo "   - 确认iptables规则正确"
+    echo "   - 检查IP转发是否启用"
+    echo "   - 验证WireGuard服务运行正常"
+    echo ""
+
+    # 5. 自动修复选项
+    echo -e "${YELLOW}是否尝试自动修复常见问题？(y/N): ${NC}"
+    read -p "" auto_fix
+
+    if [[ $auto_fix =~ ^[Yy]$ ]]; then
+        log_info "开始自动修复..."
+
+        # 启用IP转发
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+            echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+        fi
+
+        # 重启WireGuard服务
+        systemctl restart wg-quick@$WG_INTERFACE
+
+        # 重新添加iptables规则
+        if [[ -f $FORWARD_RULES_FILE ]] && [[ -s $FORWARD_RULES_FILE ]]; then
+            while IFS=':' read -r public_port client_name client_ip target_port service_name create_time; do
+                # 删除可能存在的旧规则
+                iptables -t nat -D PREROUTING -p tcp --dport "$public_port" -j DNAT --to-destination "$client_ip:$target_port" 2>/dev/null || true
+                iptables -D FORWARD -p tcp -d "$client_ip" --dport "$target_port" -j ACCEPT 2>/dev/null || true
+                iptables -D INPUT -p tcp --dport "$public_port" -j ACCEPT 2>/dev/null || true
+
+                # 添加新规则
+                iptables -t nat -A PREROUTING -p tcp --dport "$public_port" -j DNAT --to-destination "$client_ip:$target_port"
+                iptables -A FORWARD -p tcp -d "$client_ip" --dport "$target_port" -j ACCEPT
+                iptables -A FORWARD -p tcp -s "$client_ip" --sport "$target_port" -j ACCEPT
+                iptables -A INPUT -p tcp --dport "$public_port" -j ACCEPT
+                iptables -t nat -A POSTROUTING -p tcp -d "$client_ip" --dport "$target_port" -j MASQUERADE
+
+                echo "  重新添加规则: $public_port → $client_ip:$target_port"
+            done < "$FORWARD_RULES_FILE"
+
+            # 保存规则
+            if command -v iptables-save >/dev/null 2>&1; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            fi
+        fi
+
+        log_success "自动修复完成！"
+        echo ""
+        echo "请重新测试连接，如果仍有问题，请检查VPS提供商的安全组设置"
+    fi
+}
+
+# 端口转发管理主菜单
+port_forward_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║                    端口转发管理                               ║
+║                                                              ║
+║  通过服务端公网IP访问客户端服务                                ║
+║  支持RDP、SSH、HTTP等各种服务                                 ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+EOF
+        echo -e "${NC}"
+
+        echo -e "${WHITE}请选择操作：${NC}"
+        echo ""
+        echo "1. 添加端口转发规则"
+        echo "2. 列出端口转发规则"
+        echo "3. 删除端口转发规则"
+        echo "4. 端口转发故障排查"
+        echo "0. 返回主菜单"
+        echo ""
+
+        read -p "请选择操作 (0-4): " pf_choice
+
+        case $pf_choice in
+            1)
+                add_port_forward
+                read -p "按回车键继续..."
+                ;;
+            2)
+                list_port_forwards
+                read -p "按回车键继续..."
+                ;;
+            3)
+                remove_port_forward
+                read -p "按回车键继续..."
+                ;;
+            4)
+                troubleshoot_port_forward
+                read -p "按回车键继续..."
+                ;;
+            0)
+                break
+                ;;
+            *)
+                log_error "无效的选项"
+                read -p "按回车键继续..."
+                ;;
+        esac
+    done
+}
+
 # 显示主菜单
 show_main_menu() {
     clear
@@ -1241,20 +1763,7 @@ main() {
                     read -p "按回车键继续..."
                     continue
                 fi
-
-                # 检查端口转发管理脚本是否存在
-                if [[ -f "port-forward-manager.sh" ]]; then
-                    chmod +x port-forward-manager.sh
-                    ./port-forward-manager.sh
-                else
-                    log_warn "端口转发管理脚本不存在"
-                    echo "请下载完整的脚本套件或手动下载 port-forward-manager.sh"
-                    echo ""
-                    echo "快速下载命令："
-                    echo "wget https://raw.githubusercontent.com/senma231/WG-install/main/port-forward-manager.sh"
-                    echo "chmod +x port-forward-manager.sh"
-                    read -p "按回车键继续..."
-                fi
+                port_forward_menu
                 ;;
             7)
                 network_diagnosis
@@ -1294,6 +1803,8 @@ show_help() {
     echo "  • 完全交互式安装界面"
     echo "  • 国内外网络环境自动适配"
     echo "  • 智能网络优化配置"
+    echo "  • Windows客户端智能优化"
+    echo "  • 端口转发管理 (通过公网IP访问客户端)"
     echo "  • 批量客户端管理"
     echo "  • 系统监控和故障诊断"
     echo "  • 单文件集成，无需额外依赖"
