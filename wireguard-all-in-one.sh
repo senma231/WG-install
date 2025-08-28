@@ -1040,8 +1040,9 @@ show_main_menu() {
     echo "3. 删除客户端"
     echo "4. 列出所有客户端"
     echo "5. 显示服务状态"
-    echo "6. 网络诊断"
-    echo "7. 卸载WireGuard"
+    echo "6. 端口转发管理 (通过公网IP访问客户端)"
+    echo "7. 网络诊断"
+    echo "8. 卸载WireGuard"
     echo "0. 退出"
     echo ""
 }
@@ -1234,10 +1235,32 @@ main() {
                 read -p "按回车键继续..."
                 ;;
             6)
+                # 端口转发管理
+                if [[ ! -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf" ]]; then
+                    log_error "请先安装WireGuard服务端"
+                    read -p "按回车键继续..."
+                    continue
+                fi
+
+                # 检查端口转发管理脚本是否存在
+                if [[ -f "port-forward-manager.sh" ]]; then
+                    chmod +x port-forward-manager.sh
+                    ./port-forward-manager.sh
+                else
+                    log_warn "端口转发管理脚本不存在"
+                    echo "请下载完整的脚本套件或手动下载 port-forward-manager.sh"
+                    echo ""
+                    echo "快速下载命令："
+                    echo "wget https://raw.githubusercontent.com/senma231/WG-install/main/port-forward-manager.sh"
+                    echo "chmod +x port-forward-manager.sh"
+                    read -p "按回车键继续..."
+                fi
+                ;;
+            7)
                 network_diagnosis
                 read -p "按回车键继续..."
                 ;;
-            7)
+            8)
                 uninstall_wireguard
                 read -p "按回车键继续..."
                 ;;
