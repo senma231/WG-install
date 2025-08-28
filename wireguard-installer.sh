@@ -10,7 +10,12 @@
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
+# 调试模式开关
+DEBUG_MODE=${DEBUG_MODE:-false}
+
+# 错误处理
 set -e
+trap 'log_error "脚本在第 $LINENO 行出错，退出码: $?"' ERR
 
 # 颜色定义
 RED='\033[0;31m'
@@ -52,7 +57,9 @@ log_error() {
 }
 
 log_debug() {
-    echo -e "${BLUE}[DEBUG]${NC} $1"
+    if [[ $DEBUG_MODE == true ]]; then
+        echo -e "${BLUE}[DEBUG]${NC} $1"
+    fi
 }
 
 # 显示横幅
@@ -108,67 +115,106 @@ detect_system() {
 # 网络环境检测
 detect_network_environment() {
     log_info "检测网络环境..."
-    
+
     # 检测是否在中国大陆
     local china_test_sites=("www.baidu.com" "www.qq.com" "www.163.com")
     local overseas_test_sites=("www.google.com" "www.github.com" "www.cloudflare.com")
-    
+
     local china_success=0
     local overseas_success=0
-    
+
+    log_info "正在测试网络连通性，请稍候..."
+
     # 测试中国网站
     for site in "${china_test_sites[@]}"; do
-        if timeout 5 ping -c 1 "$site" >/dev/null 2>&1; then
+        log_debug "测试中国网站: $site"
+        if timeout 3 ping -c 1 -W 2 "$site" >/dev/null 2>&1; then
             ((china_success++))
+            log_debug "✓ $site 连通"
+        else
+            log_debug "✗ $site 不通"
         fi
     done
-    
+
     # 测试海外网站
     for site in "${overseas_test_sites[@]}"; do
-        if timeout 5 ping -c 1 "$site" >/dev/null 2>&1; then
+        log_debug "测试海外网站: $site"
+        if timeout 3 ping -c 1 -W 2 "$site" >/dev/null 2>&1; then
             ((overseas_success++))
+            log_debug "✓ $site 连通"
+        else
+            log_debug "✗ $site 不通"
         fi
     done
-    
+
+    log_info "网络测试结果: 国内网站 $china_success/3, 海外网站 $overseas_success/3"
+
     # 判断网络环境
     if [[ $china_success -gt $overseas_success ]]; then
         IS_CHINA_NETWORK=true
         log_info "检测到国内网络环境"
         DNS_SERVERS="223.5.5.5,119.29.29.29"  # 使用国内DNS
-    else
+    elif [[ $overseas_success -gt 0 ]]; then
         IS_CHINA_NETWORK=false
         log_info "检测到海外网络环境"
         DNS_SERVERS="8.8.8.8,1.1.1.1"  # 使用海外DNS
+    else
+        # 如果都无法连通，默认使用国内配置
+        log_warn "网络检测失败，默认使用国内网络配置"
+        IS_CHINA_NETWORK=true
+        DNS_SERVERS="223.5.5.5,119.29.29.29"
     fi
+
+    log_info "网络环境检测完成"
 }
 
 # 网络连通性测试
 test_network_connectivity() {
     log_info "测试网络连通性..."
-    
+
+    # 首先检查基本的网络连通性
+    local basic_hosts=("8.8.8.8" "223.5.5.5")
+    local basic_success=0
+
+    for host in "${basic_hosts[@]}"; do
+        if timeout 3 ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+            ((basic_success++))
+            log_debug "✓ $host 连通"
+            break  # 只要有一个能通就继续
+        fi
+    done
+
+    if [[ $basic_success -eq 0 ]]; then
+        log_warn "基本网络连通性测试失败，但继续安装..."
+        log_warn "如果安装过程中遇到下载问题，请检查网络设置"
+        return 0  # 不退出，继续安装
+    fi
+
+    # 测试HTTP连接
     local test_urls=()
     if [[ $IS_CHINA_NETWORK == true ]]; then
         test_urls=("http://www.baidu.com" "http://mirrors.aliyun.com")
     else
         test_urls=("http://www.google.com" "http://github.com")
     fi
-    
+
     local success_count=0
     for url in "${test_urls[@]}"; do
-        if timeout 10 curl -s "$url" >/dev/null 2>&1; then
+        log_debug "测试HTTP连接: $url"
+        if timeout 5 curl -s --connect-timeout 3 "$url" >/dev/null 2>&1; then
             ((success_count++))
             log_info "✓ $url 连接正常"
         else
-            log_warn "✗ $url 连接失败"
+            log_debug "✗ $url 连接失败"
         fi
     done
-    
+
     if [[ $success_count -eq 0 ]]; then
-        log_error "网络连接异常，请检查网络设置"
-        exit 1
+        log_warn "HTTP连接测试失败，但基本网络正常，继续安装..."
+        log_warn "如果遇到软件包下载问题，可能需要配置代理"
+    else
+        log_info "网络连通性测试完成 ($success_count/${#test_urls[@]} 成功)"
     fi
-    
-    log_info "网络连通性测试完成 ($success_count/${#test_urls[@]} 成功)"
 }
 
 # 获取服务器公网IP
