@@ -1023,12 +1023,14 @@ network_diagnosis() {
 
 # 检测防火墙类型
 detect_firewall_type() {
-    local firewall_type="none"
+    local firewall_type="iptables"  # 默认使用iptables
 
     # 检测UFW
     if command -v ufw >/dev/null 2>&1; then
         if ufw status | grep -q "Status: active"; then
             firewall_type="ufw"
+            echo "$firewall_type"
+            return
         fi
     fi
 
@@ -1036,20 +1038,73 @@ detect_firewall_type() {
     if command -v firewall-cmd >/dev/null 2>&1; then
         if systemctl is-active --quiet firewalld; then
             firewall_type="firewalld"
+            echo "$firewall_type"
+            return
         fi
     fi
 
-    # 检测iptables
+    # 如果没有检测到UFW或firewalld，且iptables可用，则使用iptables
     if command -v iptables >/dev/null 2>&1; then
-        local iptables_rules=$(iptables -L INPUT | wc -l)
-        if [[ $iptables_rules -gt 3 ]]; then  # 默认有3行头部信息
-            if [[ $firewall_type == "none" ]]; then
-                firewall_type="iptables"
-            fi
-        fi
+        firewall_type="iptables"
+    else
+        firewall_type="none"
     fi
 
     echo "$firewall_type"
+}
+
+# 安全保存iptables规则
+save_iptables_rules() {
+    log_info "保存iptables规则..."
+
+    # 尝试多种保存方式
+    local saved=false
+
+    # 方式1: 使用iptables-save保存到标准位置
+    if command -v iptables-save >/dev/null 2>&1; then
+        # 确保目录存在
+        if [[ ! -d "/etc/iptables" ]]; then
+            mkdir -p /etc/iptables 2>/dev/null || true
+        fi
+
+        # 尝试保存到标准位置
+        if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+            log_success "iptables规则已保存到 /etc/iptables/rules.v4"
+            saved=true
+        fi
+    fi
+
+    # 方式2: 使用netfilter-persistent (Debian/Ubuntu)
+    if [[ $saved == false ]] && command -v netfilter-persistent >/dev/null 2>&1; then
+        if netfilter-persistent save 2>/dev/null; then
+            log_success "iptables规则已通过netfilter-persistent保存"
+            saved=true
+        fi
+    fi
+
+    # 方式3: 使用service iptables save (CentOS/RHEL)
+    if [[ $saved == false ]] && command -v service >/dev/null 2>&1; then
+        if service iptables save 2>/dev/null; then
+            log_success "iptables规则已通过service保存"
+            saved=true
+        fi
+    fi
+
+    # 方式4: 保存到备用位置
+    if [[ $saved == false ]] && command -v iptables-save >/dev/null 2>&1; then
+        local backup_file="/etc/iptables-rules-backup"
+        if iptables-save > "$backup_file" 2>/dev/null; then
+            log_success "iptables规则已保存到 $backup_file"
+            saved=true
+        fi
+    fi
+
+    if [[ $saved == false ]]; then
+        log_warn "无法保存iptables规则，重启后规则可能丢失"
+        echo "  建议手动安装 iptables-persistent:"
+        echo "  sudo apt install iptables-persistent  # Debian/Ubuntu"
+        echo "  sudo yum install iptables-services    # CentOS/RHEL"
+    fi
 }
 
 # 检查端口是否在防火墙中开放
@@ -1111,15 +1166,13 @@ open_firewall_port() {
             if [[ $? -eq 0 ]]; then
                 log_success "iptables: 端口 $port/$protocol 已开放"
                 # 保存iptables规则
-                if command -v iptables-save >/dev/null 2>&1; then
-                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-                fi
+                save_iptables_rules
             else
                 log_warn "iptables: 端口 $port/$protocol 开放失败"
             fi
             ;;
         "none")
-            log_warn "未检测到活跃的防火墙，跳过端口开放"
+            log_warn "未检测到iptables，无法配置防火墙规则"
             ;;
     esac
 }
@@ -1187,9 +1240,7 @@ configure_nat_rules() {
     fi
 
     # 保存iptables规则
-    if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
+    save_iptables_rules
 }
 
 # 检查云服务商安全组
@@ -1508,9 +1559,7 @@ add_port_forward() {
     open_firewall_port "$public_port" "tcp" "Port Forward $service_name"
 
     # 保存iptables规则
-    if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
+    save_iptables_rules
 
     log_success "端口转发规则添加成功！"
     echo ""
@@ -1669,9 +1718,7 @@ remove_port_forward() {
     mv "$temp_file" "$FORWARD_RULES_FILE"
 
     # 保存iptables规则
-    if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
+    save_iptables_rules
 
     log_success "端口转发规则删除成功！"
 }
@@ -1794,9 +1841,7 @@ troubleshoot_port_forward() {
             done < "$FORWARD_RULES_FILE"
 
             # 保存规则
-            if command -v iptables-save >/dev/null 2>&1; then
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            fi
+            save_iptables_rules
         fi
 
         log_success "自动修复完成！"
