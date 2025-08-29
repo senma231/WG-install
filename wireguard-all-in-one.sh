@@ -2339,6 +2339,7 @@ EOF
 
 # 端口防封菜单
 port_guard_menu() {
+    log_info "进入端口防封管理菜单"
     while true; do
         clear
         echo -e "${CYAN}"
@@ -2371,29 +2372,48 @@ EOF
 
         case $pg_choice in
             1)
-                check_current_port_status
+                echo "正在检查当前端口状态..."
+                check_current_port_status || {
+                    log_error "端口状态检查失败"
+                }
                 read -p "按回车键继续..."
                 ;;
             2)
-                manual_port_change
+                echo "正在进入手动更换端口..."
+                manual_port_change || {
+                    log_error "手动端口更换失败"
+                }
                 read -p "按回车键继续..."
                 ;;
             3)
-                enable_port_monitoring
+                echo "正在启用自动监控..."
+                enable_port_monitoring || {
+                    log_error "启用监控失败"
+                }
                 read -p "按回车键继续..."
                 ;;
             4)
-                disable_port_monitoring
+                echo "正在停止自动监控..."
+                disable_port_monitoring || {
+                    log_error "停止监控失败"
+                }
                 read -p "按回车键继续..."
                 ;;
             5)
-                show_port_guard_status
+                echo "正在查看监控状态..."
+                show_port_guard_status || {
+                    log_error "查看状态失败"
+                }
                 read -p "按回车键继续..."
                 ;;
             6)
-                port_guard_settings
+                echo "正在进入端口防封设置..."
+                port_guard_settings || {
+                    log_error "设置功能失败"
+                }
                 ;;
             0)
+                log_info "返回主菜单"
                 break
                 ;;
             *)
@@ -2726,17 +2746,7 @@ enable_port_monitoring() {
     log_info "启用WireGuard端口自动监控..."
     echo ""
 
-    # 检查是否已安装独立的端口防封脚本
-    if [[ -f "./wireguard-port-guard.sh" ]]; then
-        log_info "检测到独立的端口防封脚本"
-        read -p "是否使用独立脚本进行监控? (y/N): " use_standalone
-
-        if [[ $use_standalone =~ ^[Yy]$ ]]; then
-            chmod +x ./wireguard-port-guard.sh
-            ./wireguard-port-guard.sh install
-            return
-        fi
-    fi
+    # 使用内置的端口监控功能
 
     # 使用内置的简单监控
     log_info "启用内置端口监控功能..."
