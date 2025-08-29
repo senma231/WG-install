@@ -622,7 +622,7 @@ generate_windows_client_config() {
 
     if [[ $traffic_mode == "partial" ]]; then
         # 内网访问模式
-        allowed_ips="10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12"
+        allowed_ips="$PRIVATE_SUBNET, 192.168.0.0/16, 172.16.0.0/12"
         dns_servers="223.5.5.5, 119.29.29.29"
         config_suffix="-internal"
         log_info "配置模式: 内网访问（仅访问服务端内网资源）"
@@ -675,7 +675,7 @@ EOF
 
     if [[ $traffic_mode == "partial" ]]; then
         echo "5. 🌐 当前为内网访问模式，本地网络不受影响"
-        echo "6. 🔗 可访问服务端内网资源：10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12"
+        echo "6. 🔗 可访问服务端内网资源：$PRIVATE_SUBNET, 192.168.0.0/16, 172.16.0.0/12"
     else
         echo "5. 🌍 当前为全局代理模式，所有流量通过VPN"
         echo "6. 🔒 提供完整的网络隐私保护"

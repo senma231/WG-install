@@ -293,7 +293,7 @@ PublicKey = $server_public_key
 # 服务端地址和端口
 Endpoint = $server_ip:$server_port
 # 仅代理服务端内网（用于远程访问服务端资源）
-AllowedIPs = 10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12
+AllowedIPs = \$PRIVATE_SUBNET, 192.168.0.0/16, 172.16.0.0/12
 # 保持连接活跃
 PersistentKeepalive = 25
 EOF
@@ -354,7 +354,8 @@ generate_windows_client() {
     local server_ip=$(curl -s http://ipv4.icanhazip.com 2>/dev/null || curl -s http://members.3322.org/dyndns/getip 2>/dev/null)
     
     # 分配客户端IP
-    local subnet_base=$(grep "Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | cut -d'=' -f2 | tr -d ' ' | cut -d'/' -f1 | cut -d'.' -f1-3)
+    local server_subnet=$(grep "Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | cut -d'=' -f2 | tr -d ' ')
+    local subnet_base=$(echo "$server_subnet" | cut -d'/' -f1 | cut -d'.' -f1-3)
     local client_ip=""
     
     for i in {2..254}; do
@@ -388,7 +389,7 @@ MTU = 1420
 [Peer]
 PublicKey = $server_public_key
 Endpoint = $server_ip:$server_port
-AllowedIPs = 10.66.0.0/16, 192.168.0.0/16, 172.16.0.0/12
+AllowedIPs = $server_subnet, 192.168.0.0/16, 172.16.0.0/12
 PersistentKeepalive = 25
 CONF
     else
