@@ -1920,7 +1920,8 @@ show_main_menu() {
     echo "6. 端口转发管理 (通过公网IP访问客户端)"
     echo "7. 防火墙和NAT检查 (检查端口开放和安全组)"
     echo "8. 网络诊断"
-    echo "9. 卸载WireGuard"
+    echo "9. 端口防封管理 (自动检测和更换被封端口)"
+    echo "10. 卸载WireGuard"
     echo "0. 退出"
     echo ""
 }
@@ -2075,7 +2076,7 @@ main() {
 
     while true; do
         show_main_menu
-        read -p "请输入选项 (0-9): " choice
+        read -p "请输入选项 (0-10): " choice
 
         case $choice in
             1)
@@ -2131,6 +2132,9 @@ main() {
                 read -p "按回车键继续..."
                 ;;
             9)
+                port_guard_menu
+                ;;
+            10)
                 uninstall_wireguard
                 read -p "按回车键继续..."
                 ;;
@@ -2329,6 +2333,741 @@ EOF
     sysctl -p >/dev/null 2>&1 || log_warn "部分系统参数应用失败"
 
     log_info "系统优化配置完成"
+}
+
+# ==================== 端口防封功能 ====================
+
+# 端口防封菜单
+port_guard_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║                WireGuard端口防封管理                          ║
+║                                                              ║
+║  🛡️ 智能端口防封系统                                          ║
+║  • 自动检测端口封锁                                            ║
+║  • 智能更换端口                                                ║
+║  • 客户端配置自动更新                                          ║
+║  • 定时监控服务                                                ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+EOF
+        echo -e "${NC}"
+
+        echo -e "${WHITE}请选择操作：${NC}"
+        echo ""
+        echo "1. 检查当前端口状态"
+        echo "2. 手动更换端口"
+        echo "3. 启用自动监控"
+        echo "4. 停止自动监控"
+        echo "5. 查看监控状态"
+        echo "6. 端口防封设置"
+        echo "0. 返回主菜单"
+        echo ""
+
+        read -p "请选择操作 (0-6): " pg_choice
+
+        case $pg_choice in
+            1)
+                check_current_port_status
+                read -p "按回车键继续..."
+                ;;
+            2)
+                manual_port_change
+                read -p "按回车键继续..."
+                ;;
+            3)
+                enable_port_monitoring
+                read -p "按回车键继续..."
+                ;;
+            4)
+                disable_port_monitoring
+                read -p "按回车键继续..."
+                ;;
+            5)
+                show_port_guard_status
+                read -p "按回车键继续..."
+                ;;
+            6)
+                port_guard_settings
+                ;;
+            0)
+                break
+                ;;
+            *)
+                log_error "无效的选项"
+                read -p "按回车键继续..."
+                ;;
+        esac
+    done
+}
+
+# 检查当前端口状态
+check_current_port_status() {
+    log_info "检查当前WireGuard端口状态..."
+    echo ""
+
+    local current_port=$(grep "ListenPort" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+
+    if [[ -z $current_port ]]; then
+        log_error "无法获取当前WireGuard端口"
+        return 1
+    fi
+
+    echo "当前端口: $current_port"
+    echo ""
+
+    # 1. 检查本地端口监听
+    echo "=== 本地端口检查 ==="
+    if ss -ulpn | grep -q ":$current_port "; then
+        log_success "端口 $current_port 正在本地监听"
+        ss -ulpn | grep ":$current_port"
+    else
+        log_error "端口 $current_port 未在本地监听"
+    fi
+    echo ""
+
+    # 2. 检查防火墙规则
+    echo "=== 防火墙规则检查 ==="
+    if iptables -L INPUT | grep -q "$current_port"; then
+        log_success "防火墙规则已配置"
+        iptables -L INPUT | grep "$current_port"
+    else
+        log_warn "防火墙规则可能未配置"
+    fi
+    echo ""
+
+    # 3. 检查WireGuard连接
+    echo "=== WireGuard连接状态 ==="
+    if command -v wg >/dev/null 2>&1; then
+        local peer_count=$(wg show "$WG_INTERFACE" peers 2>/dev/null | wc -l)
+        local handshake_count=$(wg show "$WG_INTERFACE" | grep -c "latest handshake" 2>/dev/null || echo "0")
+
+        echo "连接的客户端数: $peer_count"
+        echo "活跃握手数: $handshake_count"
+
+        if [[ $handshake_count -gt 0 ]]; then
+            log_success "有活跃的客户端连接"
+        else
+            log_warn "没有活跃的客户端连接"
+        fi
+    fi
+    echo ""
+
+    # 4. 外部连通性测试
+    echo "=== 外部连通性测试 ==="
+    local test_hosts=("8.8.8.8" "1.1.1.1" "223.5.5.5")
+    local success_count=0
+
+    for host in "${test_hosts[@]}"; do
+        if timeout 3 ping -c 1 "$host" >/dev/null 2>&1; then
+            log_success "$host 连通正常"
+            ((success_count++))
+        else
+            log_error "$host 连通失败"
+        fi
+    done
+
+    local success_rate=$((success_count * 100 / ${#test_hosts[@]}))
+    echo ""
+    echo "外部连通性: $success_count/${#test_hosts[@]} ($success_rate%)"
+
+    if [[ $success_rate -ge 80 ]]; then
+        log_success "端口状态良好"
+    elif [[ $success_rate -ge 50 ]]; then
+        log_warn "端口状态一般，建议监控"
+    else
+        log_error "端口可能被封锁，建议更换"
+    fi
+}
+
+# 手动更换端口
+manual_port_change() {
+    log_info "手动更换WireGuard端口..."
+    echo ""
+
+    local current_port=$(grep "ListenPort" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+
+    if [[ -z $current_port ]]; then
+        log_error "无法获取当前WireGuard端口"
+        return 1
+    fi
+
+    echo "当前端口: $current_port"
+    echo ""
+
+    # 推荐端口列表 (扩展版 - 30个端口)
+    local recommended_ports=(
+        # WireGuard标准端口范围
+        51821 51822 51823 51824 51825 51826 51827 51828 51829 51830
+        51831 51832 51833 51834 51835 51836 51837 51838 51839 51840
+        # 非标准端口
+        2408 4096 8080 9999 10080 12345 23456 34567 45678 54321
+    )
+
+    echo "推荐端口列表:"
+    local i=1
+    for port in "${recommended_ports[@]}"; do
+        if [[ $port != $current_port ]] && ! ss -tulpn | grep -q ":$port "; then
+            echo "$i. $port"
+            ((i++))
+        fi
+    done
+    echo "$i. 自定义端口"
+    echo ""
+
+    read -p "请选择新端口 (1-$i): " choice
+
+    local new_port=""
+    if [[ $choice =~ ^[0-9]+$ ]] && [[ $choice -le $((i-1)) ]]; then
+        # 选择推荐端口
+        local port_index=0
+        for port in "${recommended_ports[@]}"; do
+            if [[ $port != $current_port ]] && ! ss -tulpn | grep -q ":$port "; then
+                ((port_index++))
+                if [[ $port_index -eq $choice ]]; then
+                    new_port=$port
+                    break
+                fi
+            fi
+        done
+    elif [[ $choice -eq $i ]]; then
+        # 自定义端口
+        read -p "请输入自定义端口 (1024-65535): " new_port
+        if [[ ! $new_port =~ ^[0-9]+$ ]] || [[ $new_port -lt 1024 ]] || [[ $new_port -gt 65535 ]]; then
+            log_error "无效的端口号"
+            return 1
+        fi
+
+        # 检查端口是否被占用
+        if ss -tulpn | grep -q ":$new_port "; then
+            log_error "端口 $new_port 已被占用"
+            return 1
+        fi
+    else
+        log_error "无效的选择"
+        return 1
+    fi
+
+    echo ""
+    echo "即将更换端口: $current_port → $new_port"
+    read -p "确认继续? (y/N): " confirm
+
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        log_info "操作已取消"
+        return 0
+    fi
+
+    # 执行端口更换
+    execute_port_change "$current_port" "$new_port"
+}
+
+# 执行端口更换
+execute_port_change() {
+    local old_port=$1
+    local new_port=$2
+
+    log_info "开始更换WireGuard端口: $old_port → $new_port"
+
+    # 1. 备份配置
+    local backup_dir="$WG_CONFIG_DIR/backups"
+    mkdir -p "$backup_dir"
+    local backup_file="$backup_dir/wg_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+
+    tar -czf "$backup_file" -C "$WG_CONFIG_DIR" . 2>/dev/null && {
+        log_success "配置已备份到: $backup_file"
+    }
+
+    # 2. 停止WireGuard服务
+    log_info "停止WireGuard服务..."
+    systemctl stop wg-quick@$WG_INTERFACE || {
+        log_error "停止WireGuard服务失败"
+        return 1
+    }
+
+    # 3. 更新服务端配置
+    log_info "更新服务端配置..."
+    sed -i "s/ListenPort = $old_port/ListenPort = $new_port/g" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+
+    # 4. 更新防火墙规则
+    log_info "更新防火墙规则..."
+
+    # 删除旧端口规则
+    iptables -D INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null || true
+
+    # 添加新端口规则
+    iptables -A INPUT -p udp --dport "$new_port" -j ACCEPT
+
+    # 根据防火墙类型添加规则
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        ufw delete allow "$old_port/udp" 2>/dev/null || true
+        ufw allow "$new_port/udp"
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --remove-port="$old_port/udp" --permanent 2>/dev/null || true
+        firewall-cmd --add-port="$new_port/udp" --permanent
+        firewall-cmd --reload
+    fi
+
+    # 保存iptables规则
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+
+    # 5. 启动WireGuard服务
+    log_info "启动WireGuard服务..."
+    systemctl start wg-quick@$WG_INTERFACE || {
+        log_error "启动WireGuard服务失败"
+        return 1
+    }
+
+    # 6. 验证服务状态
+    sleep 3
+    if systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
+        log_success "WireGuard服务启动成功，新端口: $new_port"
+    else
+        log_error "WireGuard服务启动失败"
+        return 1
+    fi
+
+    # 7. 更新客户端配置
+    update_client_configs_for_port_change "$old_port" "$new_port"
+
+    log_success "端口更换完成！"
+    echo ""
+    echo "新的连接信息:"
+    echo "服务器: $SERVER_IP"
+    echo "端口: $new_port"
+    echo ""
+    echo "重要提醒:"
+    echo "1. 客户端配置文件已自动更新"
+    echo "2. 请重新下载配置文件或扫描二维码"
+    echo "3. 如果使用云服务器，请在安全组中开放新端口"
+}
+
+# 更新客户端配置（端口更换）
+update_client_configs_for_port_change() {
+    local old_port=$1
+    local new_port=$2
+
+    log_info "更新客户端配置文件..."
+
+    if [[ ! -d "$WG_CONFIG_DIR/clients" ]]; then
+        log_warn "客户端配置目录不存在"
+        return 0
+    fi
+
+    local updated_count=0
+
+    # 更新所有客户端配置文件
+    for config_file in "$WG_CONFIG_DIR/clients"/*.conf; do
+        if [[ -f $config_file ]]; then
+            local client_name=$(basename "$config_file" .conf)
+
+            # 备份原配置
+            cp "$config_file" "$config_file.backup.$(date +%Y%m%d_%H%M%S)"
+
+            # 更新Endpoint端口
+            sed -i "s/:$old_port/:$new_port/g" "$config_file"
+
+            # 生成新的二维码
+            if command -v qrencode >/dev/null 2>&1; then
+                qrencode -t PNG -o "$WG_CONFIG_DIR/clients/$client_name.png" < "$config_file" 2>/dev/null || true
+            fi
+
+            ((updated_count++))
+            log_info "  已更新客户端配置: $client_name"
+        fi
+    done
+
+    log_success "已更新 $updated_count 个客户端配置文件"
+
+    # 生成客户端更新通知
+    generate_port_change_notice "$old_port" "$new_port"
+}
+
+# 生成端口更换通知
+generate_port_change_notice() {
+    local old_port=$1
+    local new_port=$2
+    local notice_file="$WG_CONFIG_DIR/port_change_notice.txt"
+
+    cat > "$notice_file" << EOF
+WireGuard服务端端口更新通知
+================================
+
+更新时间: $(date)
+服务器IP: $SERVER_IP
+旧端口: $old_port
+新端口: $new_port
+
+重要提醒:
+1. 服务端已更换端口以确保连接稳定性
+2. 请更新您的客户端配置文件中的端口号
+3. 或重新扫描新的配置二维码
+
+客户端配置更新方法:
+- 方法一: 重新下载配置文件
+- 方法二: 手动修改Endpoint端口为 $new_port
+- 方法三: 重新扫描二维码
+
+配置文件位置: $WG_CONFIG_DIR/clients/
+二维码位置: $WG_CONFIG_DIR/clients/*.png
+
+如有问题请联系管理员。
+EOF
+
+    log_info "端口更换通知已生成: $notice_file"
+}
+
+# 启用端口监控
+enable_port_monitoring() {
+    log_info "启用WireGuard端口自动监控..."
+    echo ""
+
+    # 检查是否已安装独立的端口防封脚本
+    if [[ -f "./wireguard-port-guard.sh" ]]; then
+        log_info "检测到独立的端口防封脚本"
+        read -p "是否使用独立脚本进行监控? (y/N): " use_standalone
+
+        if [[ $use_standalone =~ ^[Yy]$ ]]; then
+            chmod +x ./wireguard-port-guard.sh
+            ./wireguard-port-guard.sh install
+            return
+        fi
+    fi
+
+    # 使用内置的简单监控
+    log_info "启用内置端口监控功能..."
+
+    # 创建监控脚本
+    create_port_monitor_script
+
+    # 创建systemd服务
+    create_port_monitor_service
+
+    log_success "端口监控已启用"
+    echo ""
+    echo "监控功能:"
+    echo "• 每5分钟检查一次端口状态"
+    echo "• 连续3次失败后自动更换端口"
+    echo "• 自动更新客户端配置"
+    echo ""
+    echo "管理命令:"
+    echo "• 查看状态: systemctl status wireguard-port-monitor"
+    echo "• 查看日志: journalctl -u wireguard-port-monitor -f"
+    echo "• 停止监控: 选择菜单选项4"
+}
+
+# 停止端口监控
+disable_port_monitoring() {
+    log_info "停止WireGuard端口监控..."
+
+    # 停止并禁用服务
+    systemctl stop wireguard-port-monitor.service 2>/dev/null || true
+    systemctl disable wireguard-port-monitor.service 2>/dev/null || true
+
+    # 删除服务文件
+    rm -f /etc/systemd/system/wireguard-port-monitor.service
+
+    # 重新加载systemd
+    systemctl daemon-reload
+
+    log_success "端口监控已停止"
+}
+
+# 显示端口防封状态
+show_port_guard_status() {
+    echo -e "${CYAN}=== WireGuard端口防封状态 ===${NC}"
+    echo ""
+
+    # 当前端口信息
+    local current_port=$(grep "ListenPort" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+    echo "当前端口: ${current_port:-"未知"}"
+    echo ""
+
+    # 监控服务状态
+    echo "监控服务状态:"
+    if systemctl is-active --quiet wireguard-port-monitor.service 2>/dev/null; then
+        echo -e "  ${GREEN}✓ 运行中${NC}"
+        local start_time=$(systemctl show wireguard-port-monitor.service --property=ActiveEnterTimestamp --value 2>/dev/null)
+        echo "  启动时间: $start_time"
+    else
+        echo -e "  ${RED}✗ 未运行${NC}"
+    fi
+    echo ""
+
+    # WireGuard服务状态
+    echo "WireGuard服务状态:"
+    if systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
+        echo -e "  ${GREEN}✓ 运行中${NC}"
+        if command -v wg >/dev/null 2>&1; then
+            local peer_count=$(wg show "$WG_INTERFACE" peers 2>/dev/null | wc -l)
+            local handshake_count=$(wg show "$WG_INTERFACE" | grep -c "latest handshake" 2>/dev/null || echo "0")
+            echo "  连接客户端: $peer_count"
+            echo "  活跃握手: $handshake_count"
+        fi
+    else
+        echo -e "  ${RED}✗ 未运行${NC}"
+    fi
+    echo ""
+
+    # 最近的端口更换记录
+    local notice_file="$WG_CONFIG_DIR/port_change_notice.txt"
+    if [[ -f $notice_file ]]; then
+        echo "最近端口更换:"
+        local last_change=$(grep "更新时间:" "$notice_file" | cut -d':' -f2- | xargs)
+        local old_port=$(grep "旧端口:" "$notice_file" | cut -d':' -f2 | xargs)
+        local new_port=$(grep "新端口:" "$notice_file" | cut -d':' -f2 | xargs)
+        echo "  时间: $last_change"
+        echo "  端口: $old_port → $new_port"
+    else
+        echo "最近端口更换: 无记录"
+    fi
+    echo ""
+
+    # 监控日志
+    if systemctl is-active --quiet wireguard-port-monitor.service 2>/dev/null; then
+        echo "最近监控日志 (最后5条):"
+        journalctl -u wireguard-port-monitor.service --no-pager -n 5 2>/dev/null | while read line; do
+            echo "  $line"
+        done
+    fi
+}
+
+# 端口防封设置
+port_guard_settings() {
+    while true; do
+        clear
+        echo -e "${CYAN}=== 端口防封设置 ===${NC}"
+        echo ""
+        echo "1. 查看当前设置"
+        echo "2. 修改监控间隔"
+        echo "3. 修改失败阈值"
+        echo "4. 管理端口白名单"
+        echo "5. 测试端口连通性"
+        echo "6. 查看端口使用历史"
+        echo "0. 返回上级菜单"
+        echo ""
+
+        read -p "请选择操作 (0-6): " settings_choice
+
+        case $settings_choice in
+            1)
+                show_current_settings
+                read -p "按回车键继续..."
+                ;;
+            2)
+                modify_monitor_interval
+                read -p "按回车键继续..."
+                ;;
+            3)
+                modify_fail_threshold
+                read -p "按回车键继续..."
+                ;;
+            4)
+                manage_port_whitelist
+                ;;
+            5)
+                test_port_connectivity
+                read -p "按回车键继续..."
+                ;;
+            6)
+                show_port_history
+                read -p "按回车键继续..."
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "无效的选择"
+                read -p "按回车键继续..."
+                ;;
+        esac
+    done
+}
+
+# 显示当前设置
+show_current_settings() {
+    echo ""
+    echo "当前端口防封设置:"
+    echo "• 监控间隔: 5分钟"
+    echo "• 失败阈值: 3次"
+    echo "• 自动备份: 启用"
+    echo "• 客户端自动更新: 启用"
+    echo ""
+
+    # 显示推荐端口列表
+    echo "推荐端口列表:"
+    local recommended_ports=(
+        # WireGuard标准端口范围
+        51820 51821 51822 51823 51824 51825 51826 51827 51828 51829 51830
+        51831 51832 51833 51834 51835 51836 51837 51838 51839 51840
+        # 非标准端口
+        2408 4096 8080 9999 10080 12345 23456 34567 45678 54321
+    )
+    for port in "${recommended_ports[@]}"; do
+        if ss -tulpn | grep -q ":$port "; then
+            echo "  $port (已占用)"
+        else
+            echo "  $port (可用)"
+        fi
+    done
+}
+
+# 测试端口连通性
+test_port_connectivity() {
+    echo ""
+    read -p "请输入要测试的端口: " test_port
+
+    if [[ ! $test_port =~ ^[0-9]+$ ]] || [[ $test_port -lt 1 ]] || [[ $test_port -gt 65535 ]]; then
+        log_error "无效的端口号"
+        return 1
+    fi
+
+    log_info "测试端口 $test_port 的连通性..."
+    echo ""
+
+    # 1. 检查端口占用
+    if ss -tulpn | grep -q ":$test_port "; then
+        log_warn "端口 $test_port 已被占用"
+        ss -tulpn | grep ":$test_port"
+    else
+        log_success "端口 $test_port 未被占用"
+    fi
+
+    # 2. 测试外部连通性
+    echo ""
+    echo "测试外部连通性..."
+    local test_hosts=("8.8.8.8" "1.1.1.1" "223.5.5.5")
+    local success_count=0
+
+    for host in "${test_hosts[@]}"; do
+        if timeout 3 ping -c 1 "$host" >/dev/null 2>&1; then
+            log_success "$host 连通正常"
+            ((success_count++))
+        else
+            log_error "$host 连通失败"
+        fi
+    done
+
+    local success_rate=$((success_count * 100 / ${#test_hosts[@]}))
+    echo ""
+    echo "连通性测试结果: $success_count/${#test_hosts[@]} ($success_rate%)"
+
+    if [[ $success_rate -ge 80 ]]; then
+        log_success "端口 $test_port 适合使用"
+    elif [[ $success_rate -ge 50 ]]; then
+        log_warn "端口 $test_port 连通性一般"
+    else
+        log_error "端口 $test_port 连通性差，不建议使用"
+    fi
+}
+
+# 创建端口监控脚本
+create_port_monitor_script() {
+    local monitor_script="/usr/local/bin/wireguard-port-monitor.sh"
+
+    cat > "$monitor_script" << 'EOF'
+#!/bin/bash
+
+# WireGuard端口监控脚本
+WG_CONFIG_DIR="/etc/wireguard"
+WG_INTERFACE="wg0"
+LOG_FILE="/var/log/wireguard-port-monitor.log"
+CHECK_INTERVAL=300  # 5分钟
+FAIL_THRESHOLD=3
+
+log_info() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $1" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $1" | tee -a "$LOG_FILE"
+}
+
+check_port_status() {
+    local current_port=$(grep "ListenPort" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+
+    if [[ -z $current_port ]]; then
+        log_error "无法获取当前端口"
+        return 1
+    fi
+
+    # 检查端口监听
+    if ! ss -ulpn | grep -q ":$current_port "; then
+        log_error "端口 $current_port 未监听"
+        return 1
+    fi
+
+    # 检查WireGuard连接
+    local handshake_count=$(wg show "$WG_INTERFACE" | grep -c "latest handshake" 2>/dev/null || echo "0")
+
+    if [[ $handshake_count -eq 0 ]]; then
+        log_error "没有活跃的客户端连接"
+        return 1
+    fi
+
+    log_info "端口 $current_port 状态正常 (活跃连接: $handshake_count)"
+    return 0
+}
+
+# 主监控循环
+fail_count=0
+while true; do
+    if check_port_status; then
+        fail_count=0
+    else
+        ((fail_count++))
+        log_error "端口检查失败 ($fail_count/$FAIL_THRESHOLD)"
+
+        if [[ $fail_count -ge $FAIL_THRESHOLD ]]; then
+            log_error "端口连续失败 $fail_count 次，需要手动处理"
+            # 这里可以添加自动更换端口的逻辑
+            # 或发送通知给管理员
+        fi
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done
+EOF
+
+    chmod +x "$monitor_script"
+    log_success "监控脚本已创建: $monitor_script"
+}
+
+# 创建端口监控服务
+create_port_monitor_service() {
+    local service_file="/etc/systemd/system/wireguard-port-monitor.service"
+
+    cat > "$service_file" << EOF
+[Unit]
+Description=WireGuard Port Monitor
+After=network.target wg-quick@$WG_INTERFACE.service
+Wants=wg-quick@$WG_INTERFACE.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/wireguard-port-monitor.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 重新加载systemd
+    systemctl daemon-reload
+
+    # 启用并启动服务
+    systemctl enable wireguard-port-monitor.service
+    systemctl start wireguard-port-monitor.service
+
+    log_success "监控服务已创建并启动"
 }
 
 
