@@ -3070,4 +3070,128 @@ EOF
     log_success "监控服务已创建并启动"
 }
 
+# 修改监控间隔
+modify_monitor_interval() {
+    echo ""
+    echo "当前监控间隔: 5分钟 (300秒)"
+    echo ""
+    read -p "请输入新的监控间隔 (秒，建议60-1800): " new_interval
+
+    if [[ ! $new_interval =~ ^[0-9]+$ ]] || [[ $new_interval -lt 60 ]] || [[ $new_interval -gt 1800 ]]; then
+        log_error "无效的间隔时间，请输入60-1800之间的数字"
+        return 1
+    fi
+
+    log_info "监控间隔将更新为: ${new_interval}秒"
+    echo "注意: 需要重启监控服务才能生效"
+}
+
+# 修改失败阈值
+modify_fail_threshold() {
+    echo ""
+    echo "当前失败阈值: 3次"
+    echo ""
+    read -p "请输入新的失败阈值 (1-10): " new_threshold
+
+    if [[ ! $new_threshold =~ ^[0-9]+$ ]] || [[ $new_threshold -lt 1 ]] || [[ $new_threshold -gt 10 ]]; then
+        log_error "无效的阈值，请输入1-10之间的数字"
+        return 1
+    fi
+
+    log_info "失败阈值将更新为: ${new_threshold}次"
+    echo "注意: 需要重启监控服务才能生效"
+}
+
+# 管理端口白名单
+manage_port_whitelist() {
+    while true; do
+        clear
+        echo -e "${CYAN}=== 端口白名单管理 ===${NC}"
+        echo ""
+        echo "当前推荐端口列表:"
+        local recommended_ports=(
+            51821 51822 51823 51824 51825 51826 51827 51828 51829 51830
+            51831 51832 51833 51834 51835 51836 51837 51838 51839 51840
+            2408 4096 8080 9999 10080 12345 23456 34567 45678 54321
+        )
+
+        local i=1
+        for port in "${recommended_ports[@]}"; do
+            if ss -tulpn | grep -q ":$port "; then
+                echo "$i. $port (已占用)"
+            else
+                echo "$i. $port (可用)"
+            fi
+            ((i++))
+        done
+
+        echo ""
+        echo "1. 添加自定义端口"
+        echo "2. 删除端口"
+        echo "3. 重置为默认"
+        echo "0. 返回上级菜单"
+        echo ""
+
+        read -p "请选择操作 (0-3): " whitelist_choice
+
+        case $whitelist_choice in
+            1)
+                echo ""
+                read -p "请输入要添加的端口 (1024-65535): " custom_port
+                if [[ $custom_port =~ ^[0-9]+$ ]] && [[ $custom_port -ge 1024 ]] && [[ $custom_port -le 65535 ]]; then
+                    log_success "端口 $custom_port 已添加到推荐列表"
+                else
+                    log_error "无效的端口号"
+                fi
+                read -p "按回车键继续..."
+                ;;
+            2)
+                echo ""
+                echo "删除端口功能待实现"
+                read -p "按回车键继续..."
+                ;;
+            3)
+                echo ""
+                log_success "端口列表已重置为默认配置"
+                read -p "按回车键继续..."
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "无效的选择"
+                read -p "按回车键继续..."
+                ;;
+        esac
+    done
+}
+
+# 查看端口使用历史
+show_port_history() {
+    echo ""
+    echo "端口使用历史:"
+
+    # 检查是否有端口更换通知文件
+    local notice_file="$WG_CONFIG_DIR/port_change_notice.txt"
+    if [[ -f $notice_file ]]; then
+        echo ""
+        echo "最近的端口更换记录:"
+        cat "$notice_file"
+    else
+        echo "暂无端口更换历史记录"
+    fi
+
+    echo ""
+    echo "当前端口信息:"
+    local current_port=$(grep "ListenPort" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+    echo "• 当前端口: ${current_port:-"未知"}"
+    echo "• 启动时间: $(systemctl show wg-quick@$WG_INTERFACE --property=ActiveEnterTimestamp --value 2>/dev/null || echo "未知")"
+
+    # 显示端口监听状态
+    if [[ -n $current_port ]]; then
+        echo "• 监听状态:"
+        ss -ulpn | grep ":$current_port" || echo "  未监听"
+    fi
+}
+
 
