@@ -2843,15 +2843,12 @@ port_guard_settings() {
         echo -e "${CYAN}=== 端口防封设置 ===${NC}"
         echo ""
         echo "1. 查看当前设置"
-        echo "2. 修改监控间隔"
-        echo "3. 修改失败阈值"
-        echo "4. 管理端口白名单"
-        echo "5. 测试端口连通性"
-        echo "6. 查看端口使用历史"
+        echo "2. 测试端口连通性"
+        echo "3. 查看端口使用历史"
         echo "0. 返回上级菜单"
         echo ""
 
-        read -p "请选择操作 (0-6): " settings_choice
+        read -p "请选择操作 (0-3): " settings_choice
 
         case $settings_choice in
             1)
@@ -2859,29 +2856,19 @@ port_guard_settings() {
                 read -p "按回车键继续..."
                 ;;
             2)
-                modify_monitor_interval
-                read -p "按回车键继续..."
-                ;;
-            3)
-                modify_fail_threshold
-                read -p "按回车键继续..."
-                ;;
-            4)
-                manage_port_whitelist
-                ;;
-            5)
                 test_port_connectivity
                 read -p "按回车键继续..."
                 ;;
-            6)
+            3)
                 show_port_history
                 read -p "按回车键继续..."
                 ;;
             0)
+                log_info "返回上级菜单"
                 break
                 ;;
             *)
-                echo "无效的选择"
+                log_error "无效的选择"
                 read -p "按回车键继续..."
                 ;;
         esac
@@ -3194,4 +3181,7 @@ show_port_history() {
     fi
 }
 
-
+# 脚本入口点
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
